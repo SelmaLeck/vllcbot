@@ -39,6 +39,8 @@ const FileStore=FileStoreFactory(session);
 app.use(session({store:new FileStore({path:path.join(DATA_DIR,'sessions'),ttl:12*60*60,retries:0}),name:'vullco.sid',secret:process.env.SESSION_SECRET||crypto.randomBytes(32).toString('hex'),resave:false,saveUninitialized:false,cookie:{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production'&&process.env.TRUST_PROXY==='1',maxAge:12*60*60*1000}}));
 if(process.env.TRUST_PROXY==='1') app.set('trust proxy',1);
 let state=JSON.parse(fs.readFileSync(FILE,'utf8'));
+// Default to enabled for existing installations, but remember intentional shutdowns.
+if(typeof state.botEnabled!=='boolean')state.botEnabled=true;
 const runtime={botUsername:BOT_USERNAME,online:false,connected:false,lastError:'',messages:0,startedAt:Date.now(),lastBirthdayDate:'',lastBirthdayNotice:new Set()};
 const timerRuntime=new Map(),cooldowns=new Map();
 let twitchAuth=null, twitch=null, refreshInFlight=null, connecting=false;
@@ -64,14 +66,36 @@ app.post('/api/login',(req,res)=>{if(!process.env.PANEL_PASSWORD||!safeEq(req.bo
 app.get('/api/me',(req,res)=>res.json({loggedIn:!!req.session.admin,csrf:req.session.admin?req.session.csrf:null,channel}));
 app.post('/api/logout',auth,csrf,(req,res)=>req.session.destroy(()=>res.json({ok:true})));
 app.get('/api/state',auth,(req,res)=>res.json({state,runtime:{...runtime,lastBirthdayNotice:undefined}}));
-app.get('/api/twitch/status',auth,(req,res)=>res.json({configured:configured(),authorized:!!twitchAuth?.refresh_token,connected:runtime.connected,username:BOT_USERNAME,error:runtime.lastError}));
+app.get('/api/twitch/status',auth,(req,res)=>res.json({configured:configured(),authorized:!!twitchAuth?.refresh_token,connected:runtime.connected,enabled:state.botEnabled,username:BOT_USERNAME,error:runtime.lastError}));
+
+// These controls manage only the Twitch chat client. The web panel stays online.
+app.post('/api/bot/stop',auth,csrf,async(req,res)=>{
+ state.botEnabled=false;save();
+ try {if(twitch)await twitch.disconnect();}catch(e){console.warn('Stop:',e.message);}
+ twitch=null;runtime.connected=false;
+ res.json({ok:true,enabled:false});
+});
+app.post('/api/bot/start',auth,csrf,async(req,res)=>{
+ if(!configured()||!twitchAuth?.refresh_token)return res.status(400).json({error:'Bitte zuerst Twitch verbinden'});
+ state.botEnabled=true;save();
+ try {await connectTwitch();res.json({ok:true,enabled:true});}
+ catch(e){res.status(503).json({error:e.message});}
+});
+app.post('/api/bot/restart',auth,csrf,async(req,res)=>{
+ if(!configured()||!twitchAuth?.refresh_token)return res.status(400).json({error:'Bitte zuerst Twitch verbinden'});
+ state.botEnabled=true;save();
+ try {if(twitch)await twitch.disconnect();}catch(e){console.warn('Restart:',e.message);}
+ twitch=null;runtime.connected=false;
+ try {await connectTwitch();res.json({ok:true,enabled:true});}
+ catch(e){res.status(503).json({error:e.message});}
+});
 
 app.get('/api/spotify/status',auth,(req,res)=>res.json({configured:spotifyReady(),authorized:!!(spotifyAuth?.refresh_token||process.env.SPOTIFY_REFRESH_TOKEN)}));
 app.get('/auth/spotify/start',auth,(req,res)=>{if(!spotifyReady())return res.status(400).send('Spotify-App noch nicht konfiguriert');const nonce=crypto.randomBytes(32).toString('hex');req.session.spotifyState=nonce;req.session.save(err=>{if(err)return res.status(500).send('Session-Fehler');const u=new URL('https://accounts.spotify.com/authorize');for(const [k,v] of Object.entries({response_type:'code',client_id:SPOTIFY_CLIENT_ID,redirect_uri:SPOTIFY_REDIRECT_URI,scope:'user-read-currently-playing',state:nonce,show_dialog:'true'}))u.searchParams.set(k,v);res.redirect(u.toString());});});
 app.get('/auth/spotify/callback',auth,async(req,res)=>{const expected=req.session.spotifyState;delete req.session.spotifyState;if(!expected||typeof req.query.state!=='string'||!safeEq(expected,req.query.state))return res.status(403).send('Spotify-Verbindung abgelaufen. Bitte erneut versuchen.');if(req.query.error)return res.status(400).send('Spotify-Anmeldung abgebrochen');if(typeof req.query.code!=='string')return res.status(400).send('Kein Spotify-Code erhalten');try{const d=await spotifyToken({grant_type:'authorization_code',code:req.query.code,redirect_uri:SPOTIFY_REDIRECT_URI});if(!d.refresh_token)throw Error('Kein Spotify-Refresh-Token erhalten');storeSpotifyAuth({access_token:d.access_token,refresh_token:d.refresh_token,expires_at:Date.now()+d.expires_in*1000});res.redirect('/?spotify=connected');}catch(e){res.status(400).send('Spotify-Verbindung fehlgeschlagen: '+String(e.message).replace(/[<>&]/g,''));}});
 
 app.get('/auth/twitch/start',auth,(req,res)=>{if(!configured())return res.status(400).send('Bitte TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET und TWITCH_BOT_USERNAME in .env setzen.');const nonce=crypto.randomBytes(32).toString('hex');req.session.twitchState=nonce;req.session.save(err=>{if(err)return res.status(500).send('Session konnte nicht gespeichert werden');const u=new URL('https://id.twitch.tv/oauth2/authorize');for(const [k,v] of Object.entries({client_id:CLIENT_ID,redirect_uri:REDIRECT_URI,response_type:'code',scope:OAUTH_SCOPES.join(' '),state:nonce,force_verify:'true'}))u.searchParams.set(k,v);res.redirect(u.toString());});});
-app.get('/auth/twitch/callback',auth,async(req,res)=>{const expected=req.session.twitchState;delete req.session.twitchState;if(!expected||typeof req.query.state!=='string'||!safeEq(expected,req.query.state))return res.status(403).send('OAuth State ungültig. Bitte nochmal im Dashboard starten.');if(req.query.error)return res.status(400).send('Twitch Anmeldung abgebrochen: '+String(req.query.error));if(typeof req.query.code!=='string')return res.status(400).send('Kein OAuth-Code erhalten');try{const d=await tokenRequest({grant_type:'authorization_code',code:req.query.code,redirect_uri:REDIRECT_URI});const v=await fetch('https://id.twitch.tv/oauth2/validate',{headers:{Authorization:'OAuth '+d.access_token}});if(!v.ok)throw Error('Twitch Token konnte nicht validiert werden');const identity=await v.json();if(identity.login?.toLowerCase()!==BOT_USERNAME)throw Error('Falscher Twitch-Account: @'+identity.login+'. Bitte mit @'+BOT_USERNAME+' anmelden.');if(identity.client_id!==CLIENT_ID||!OAUTH_SCOPES.every(x=>identity.scopes?.includes(x)))throw Error('Twitch App oder Berechtigungen stimmen nicht');storeTwitchAuth({access_token:d.access_token,refresh_token:d.refresh_token,expires_at:Date.now()+d.expires_in*1000,username:identity.login});await connectTwitch();res.redirect('/?twitch=connected');}catch(e){runtime.lastError=e.message;res.status(400).send('Twitch-Verbindung fehlgeschlagen: '+String(e.message).replace(/[<>&]/g,'')+' – bitte zurück ins Dashboard.');}});
+app.get('/auth/twitch/callback',auth,async(req,res)=>{const expected=req.session.twitchState;delete req.session.twitchState;if(!expected||typeof req.query.state!=='string'||!safeEq(expected,req.query.state))return res.status(403).send('OAuth State ungültig. Bitte nochmal im Dashboard starten.');if(req.query.error)return res.status(400).send('Twitch Anmeldung abgebrochen: '+String(req.query.error));if(typeof req.query.code!=='string')return res.status(400).send('Kein OAuth-Code erhalten');try{const d=await tokenRequest({grant_type:'authorization_code',code:req.query.code,redirect_uri:REDIRECT_URI});const v=await fetch('https://id.twitch.tv/oauth2/validate',{headers:{Authorization:'OAuth '+d.access_token}});if(!v.ok)throw Error('Twitch Token konnte nicht validiert werden');const identity=await v.json();if(identity.login?.toLowerCase()!==BOT_USERNAME)throw Error('Falscher Twitch-Account: @'+identity.login+'. Bitte mit @'+BOT_USERNAME+' anmelden.');if(identity.client_id!==CLIENT_ID||!OAUTH_SCOPES.every(x=>identity.scopes?.includes(x)))throw Error('Twitch App oder Berechtigungen stimmen nicht');storeTwitchAuth({access_token:d.access_token,refresh_token:d.refresh_token,expires_at:Date.now()+d.expires_in*1000,username:identity.login});state.botEnabled=true;save();await connectTwitch();res.redirect('/?twitch=connected');}catch(e){runtime.lastError=e.message;res.status(400).send('Twitch-Verbindung fehlgeschlagen: '+String(e.message).replace(/[<>&]/g,'')+' – bitte zurück ins Dashboard.');}});
 
 const commandName=v=>/^![a-z0-9_]{2,30}$/.test(v);
 function updateCollection(type,validator){
@@ -89,6 +113,7 @@ app.use(express.static(path.join(ROOT,'public')));
 app.get('*',(req,res)=>res.sendFile(path.join(ROOT,'public','index.html')));
 
 async function connectTwitch(){
+ if(!state.botEnabled)return;
  if(connecting)return;
  connecting=true;
  try{
@@ -138,5 +163,5 @@ setInterval(async()=>{if(!runtime.connected)return;for(const t of state.timers){
 setInterval(async()=>{if(!state.settings.birthdayAnnouncements||!runtime.connected)return;for(const user of dailyBirthdays()){if(runtime.lastBirthdayNotice.has(user))continue;await say(state.settings.birthdayMessage.replaceAll('{user}',user));runtime.lastBirthdayNotice.add(user);}},60000);
 const port=Number(process.env.PORT)||3000;
 app.listen(port,()=>console.log(`Vullco Panel: http://localhost:${port}`));
-if(configured()&&twitchAuth?.refresh_token)connectTwitch().catch(()=>{});else console.warn('Twitch noch nicht verbunden. Öffne das Dashboard und klicke auf Mit Twitch verbinden.');
-setInterval(async()=>{if(!twitchAuth?.refresh_token||!configured())return;try{await validateTwitch();if(!runtime.connected&&!connecting)await connectTwitch();}catch(e){runtime.lastError=e.message;console.error('Twitch Refresh:',e.message);}},5*60*1000);
+if(state.botEnabled&&configured()&&twitchAuth?.refresh_token)connectTwitch().catch(()=>{});else console.warn('Twitch noch nicht verbunden. Öffne das Dashboard und klicke auf Mit Twitch verbinden.');
+setInterval(async()=>{if(!state.botEnabled||!twitchAuth?.refresh_token||!configured())return;try{await validateTwitch();if(!runtime.connected&&!connecting)await connectTwitch();}catch(e){runtime.lastError=e.message;console.error('Twitch Refresh:',e.message);}},5*60*1000);
