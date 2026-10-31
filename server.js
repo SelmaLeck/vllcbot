@@ -14,7 +14,15 @@ fs.mkdirSync(DATA_DIR,{recursive:true});
 const FILE=path.join(DATA_DIR,'state.json');
 const TOKEN_FILE=path.join(DATA_DIR,'twitch-auth.json');
 const SPOTIFY_FILE=path.join(DATA_DIR,'spotify-auth.json');
-if(!fs.existsSync(FILE))fs.copyFileSync(path.join(ROOT,'data','state.json'),FILE);
+if(!fs.existsSync(FILE)){
+  const bundled=path.join(ROOT,'data','state.json');
+  if(bundled!==FILE && fs.existsSync(bundled)){
+    fs.copyFileSync(bundled,FILE);
+  }else{
+    const initialState={commands:[],timers:[],birthdays:{},settings:{birthdayMessage:'🎂 Alles Gute zum Geburtstag, @{user}! 💙',birthdayAnnouncements:true,globalCooldown:5}};
+    fs.writeFileSync(FILE,JSON.stringify(initialState,null,2));
+  }
+}
 const CLIENT_ID=process.env.TWITCH_CLIENT_ID||'';
 const CLIENT_SECRET=process.env.TWITCH_CLIENT_SECRET||'';
 const REDIRECT_URI=process.env.TWITCH_REDIRECT_URI||'http://localhost:3000/auth/twitch/callback';
