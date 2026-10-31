@@ -1,0 +1,12 @@
+{
+  "commands": [],
+  "timers": [],
+  "birthdays": {
+    "vullco": "01.11"
+  },
+  "settings": {
+    "birthdayMessage": "🎂 Alles Gute zum Geburtstag, @{user}! 💙",
+    "birthdayAnnouncements": true,
+    "globalCooldown": 5
+  }
+}
